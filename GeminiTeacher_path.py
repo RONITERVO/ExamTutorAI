@@ -18,6 +18,9 @@ import configparser
 import re # For parsing references
 import webbrowser # For opening files cross-platform (basic)
 import subprocess # For more control over opening files
+import urllib.parse # For file URI encoding
+import urllib.request # For file URI encoding
+from typing import Union # Import Union for type hinting compatibility
 
 
 # --- PySide6 Imports ---
@@ -25,7 +28,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout,
     QTabWidget, QLabel, QLineEdit, QTextEdit, QPushButton, QComboBox,
     QListWidget, QFileDialog, QMessageBox, QGroupBox, QScrollArea, QSizePolicy,
-    QProgressBar, QFrame, QStackedWidget # Added QProgressBar, QFrame, QStackedWidget
+    QProgressBar, QFrame, QStackedWidget, QDoubleSpinBox # Added QDoubleSpinBox
 )
 from PySide6.QtCore import Qt, QObject, Signal, QThread, Slot, QTimer, QSize # Added QSize
 from PySide6.QtGui import QPalette, QColor, QFont, QIcon, QPixmap # Added QIcon, QPixmap
@@ -33,6 +36,8 @@ from PySide6.QtGui import QPalette, QColor, QFont, QIcon, QPixmap # Added QIcon,
 # --- AI Imports ---
 try:
     import google.generativeai as genai
+    from google.generativeai.types import GenerationConfigDict # For temperature typing
+    from google.generativeai.generative_models import ChatSession # For memory typing
     import google.api_core.exceptions
     gemini_imported = True
 except ImportError:
@@ -61,6 +66,7 @@ CONFIG_FILE = 'ai_tutor_config.ini'
 DEFAULT_MODEL = 'gemini-1.5-flash'
 DEFAULT_LANGUAGE = 'English'
 LANGUAGES = ['English', 'Finnish']
+DEFAULT_TEMPERATURE = 0.7 # Default creativity setting
 DEFAULT_SYSTEM_INSTRUCTION = (
     "You are an AI tutor. Use ONLY the provided documents to generate questions, "
     "provide hints, and evaluate answers for a student studying the material. "
@@ -103,35 +109,39 @@ ALL_MATERIALS_SKILL_NAME = "All Materials Review"
 # Worker Object for AI Calls
 # ==================================
 class AIWorker(QObject):
-    """Runs AI tasks in a separate thread."""
-    # Signals to emit results or errors back to the main thread
+    """Runs AI tasks (model generation or chat message) in a separate thread."""
     result_ready = Signal(str, str) # task_identifier, result_text
     error_occurred = Signal(str, str) # task_identifier, error_message
     progress_update = Signal(str) # message for status updates
 
-    def __init__(self, model, prompt_parts, task_identifier):
+    # Accept either a model or a chat session
+    # Use typing.Union for Python 3.9 compatibility
+    def __init__(self, model_or_chat: Union[genai.GenerativeModel, ChatSession], prompt_parts, task_identifier):
         super().__init__()
-        self.model = model
+        self.model_or_chat = model_or_chat
         self.prompt_parts = prompt_parts
         self.task_identifier = task_identifier
         self._is_running = True # Flag to allow graceful stopping
 
-    @Slot() # Decorator to mark this method as a slot runnable by the thread
+    @Slot()
     def run(self):
-        """Execute the AI call."""
-        if not self._is_running or not self.model:
-            self.error_occurred.emit(self.task_identifier, "AI Worker stopped or model not configured.")
+        """Execute the AI call using either the model or the chat session."""
+        if not self._is_running or not self.model_or_chat:
+            self.error_occurred.emit(self.task_identifier, "AI Worker stopped or AI object not configured.")
             return
 
+        is_chat_session = isinstance(self.model_or_chat, ChatSession)
+        call_type = "Chat" if is_chat_session else "Model"
+
         try:
-            self.progress_update.emit(f"Calling AI for {self.task_identifier}...")
+            self.progress_update.emit(f"Calling AI ({call_type}) for {self.task_identifier}...")
             print("-" * 20)
-            print(f"Calling AI ({self.task_identifier}):")
-            # Log prompt parts carefully
+            print(f"Calling AI ({call_type} - {self.task_identifier}):")
+            # Log prompt parts (content being sent)
             for i, part in enumerate(self.prompt_parts):
                 if isinstance(part, str):
                     print(f"  Part {i} (text): {part[:150]}{'...' if len(part) > 150 else ''}")
-                else: # Should be a File object from genai.upload_file
+                else: # Should be a File object
                     uri = getattr(part, 'uri', 'N/A')
                     display_name = getattr(part, 'display_name', 'Unknown File Object')
                     print(f"  Part {i} (file): Name='{display_name}', URI='{uri}'")
@@ -139,63 +149,85 @@ class AIWorker(QObject):
 
             # --- Actual Gemini API Call ---
             if not self._is_running:
-                self.error_occurred.emit(self.task_identifier, "AI Worker stopped before API call.")
+                self.error_occurred.emit(self.task_identifier, f"AI Worker stopped before {call_type} API call.")
                 return
-            response = self.model.generate_content(self.prompt_parts)
+
+            if is_chat_session:
+                # Send message using the chat session
+                # The prompt_parts here represent the *content* of the user's turn
+                response = self.model_or_chat.send_message(self.prompt_parts)
+            else:
+                # Generate content directly using the model
+                response = self.model_or_chat.generate_content(self.prompt_parts)
 
             if not self._is_running:
-                self.error_occurred.emit(self.task_identifier, "AI Worker stopped during API call.")
+                self.error_occurred.emit(self.task_identifier, f"AI Worker stopped during {call_type} API call.")
                 return
 
-            # --- Robust Response Handling ---
+            # --- Robust Response Handling (Should work for both generate_content and send_message) ---
             response_text = None
             try:
+                # Check for blocking due to prompt feedback
                 if response.prompt_feedback and response.prompt_feedback.block_reason:
                     reason = response.prompt_feedback.block_reason.name
-                    raise ValueError(f"AI request blocked due to safety ({reason}).")
+                    raise ValueError(f"AI request blocked due to safety ({reason}). Prompt Feedback: {response.prompt_feedback}")
 
+                # Check candidates (send_message also has candidates)
                 if not response.candidates:
+                    # Try to get finish_message if available (might be on response directly for send_message errors?)
                     finish_message = getattr(response, 'finish_message', 'No details provided.')
                     raise ValueError(f"AI returned no response candidates. Reason: {finish_message}")
 
                 candidate = response.candidates[0]
                 finish_reason = candidate.finish_reason.name
 
+                # Check finish reason and safety ratings
                 if finish_reason not in ["STOP", "MAX_TOKENS"]:
                     safety_issue = False
                     if candidate.safety_ratings:
                         for rating in candidate.safety_ratings:
+                            # Check if probability is HARMFUL or worse (adjust as needed)
                             if rating.probability.name not in ["NEGLIGIBLE", "LOW"]:
                                 safety_issue = True
-                                raise ValueError(f"AI response may be blocked due to safety ({rating.category.name}). Finish reason: {finish_reason}")
+                                raise ValueError(f"AI response may be blocked due to safety ({rating.category.name} - {rating.probability.name}). Finish reason: {finish_reason}")
+                    # If not blocked by safety, but still not STOP/MAX_TOKENS, raise error
                     if not safety_issue:
                         raise ValueError(f"AI response stopped unexpectedly. Finish reason: {finish_reason}")
 
-                if candidate.content and candidate.content.parts:
-                    response_text = "".join(part.text for part in candidate.content.parts if hasattr(part, 'text'))
-                else:
-                    if finish_reason == "STOP": response_text = ""
-                    else: raise ValueError(f"AI returned no text content. Finish reason: {finish_reason}")
+                # Extract text content
+                # Note: send_message response text is directly available via response.text
+                if is_chat_session:
+                     response_text = response.text # Direct access for chat
+                elif candidate.content and candidate.content.parts: # For generate_content
+                     response_text = "".join(part.text for part in candidate.content.parts if hasattr(part, 'text'))
+                else: # Handle cases like empty response with STOP reason
+                     if finish_reason == "STOP": response_text = ""
+                     else: raise ValueError(f"AI returned no text content. Finish reason: {finish_reason}")
 
             except ValueError as ve:
                 raise # Re-raise the ValueError
             except Exception as e:
+                # Add more context to parsing errors
+                print(f"Response object details on parsing error: {response}")
                 raise ValueError(f"Failed to parse AI response: {e}") from e
 
-            if response_text is None:
+            if response_text is None: # Should not happen if parsing is correct
                 raise ValueError("AI returned an unparsable or empty response.")
 
-            print(f"AI Response Received for {self.task_identifier} (truncated):", response_text[:200].strip() + "...")
+            print(f"AI Response Received ({call_type}) for {self.task_identifier} (truncated):", response_text[:200].strip() + "...")
             if self._is_running:
                 self.result_ready.emit(self.task_identifier, response_text.strip())
 
         except (google.api_core.exceptions.GoogleAPIError, ConnectionError, ValueError) as e:
-            print(f"Error in AI Worker ({self.task_identifier}): {e}")
-            if self._is_running:
+            print(f"Error in AI Worker ({call_type} - {self.task_identifier}): {e}")
+            if self._is_running: # Only emit error if not intentionally stopped
                 self.error_occurred.emit(self.task_identifier, f"AI Error: {e}")
         except Exception as e:
-            print(f"Unexpected Error in AI Worker ({self.task_identifier}): {e}")
-            if self._is_running:
+            # Catch potential issues with send_message specifically if needed
+            print(f"Unexpected Error in AI Worker ({call_type} - {self.task_identifier}): {e}")
+            import traceback
+            traceback.print_exc() # Print full traceback for unexpected errors
+            if self._is_running: # Only emit error if not intentionally stopped
                 self.error_occurred.emit(self.task_identifier, f"Unexpected Error: {e}")
 
     def stop(self):
@@ -637,6 +669,15 @@ class SettingsWidget(QWidget):
         self.language_combo = QComboBox()
         self.language_combo.addItems(LANGUAGES)
         ai_layout.addRow("Question Language:", self.language_combo)
+
+        # Temperature Setting
+        self.temperature_spinbox = QDoubleSpinBox()
+        self.temperature_spinbox.setRange(0.0, 2.0) # Common range for temperature
+        self.temperature_spinbox.setSingleStep(0.1)
+        self.temperature_spinbox.setValue(DEFAULT_TEMPERATURE)
+        self.temperature_spinbox.setToolTip("Controls randomness (0=deterministic, >1=more creative)")
+        ai_layout.addRow("AI Temperature:", self.temperature_spinbox)
+
         self.instruction_input = QTextEdit(DEFAULT_SYSTEM_INSTRUCTION)
         self.instruction_input.setAcceptRichText(False)
         self.instruction_input.setFixedHeight(100)
@@ -710,17 +751,21 @@ class SettingsWidget(QWidget):
         self.pdf_list_widget.addItems(basenames)
 
     def get_settings(self):
+        """Gets all settings from the UI elements."""
         return {
             'api_key': self.api_key_input.text(),
             'model': self.model_input.text(),
             'language': self.language_combo.currentText(),
+            'temperature': self.temperature_spinbox.value(), # Get temperature
             'instruction': self.instruction_input.toPlainText().strip() or DEFAULT_SYSTEM_INSTRUCTION
         }
 
     def set_settings(self, config_data):
+        """Sets the UI elements based on loaded config data."""
         self.api_key_input.setText(config_data.get('api_key', ''))
         self.model_input.setText(config_data.get('model', DEFAULT_MODEL))
         self.language_combo.setCurrentText(config_data.get('language', DEFAULT_LANGUAGE))
+        self.temperature_spinbox.setValue(config_data.get('temperature', DEFAULT_TEMPERATURE)) # Set temperature
         self.instruction_input.setPlainText(config_data.get('instruction', DEFAULT_SYSTEM_INSTRUCTION))
 
     def set_status(self, message):
@@ -731,6 +776,7 @@ class SettingsWidget(QWidget):
         self.api_key_input.setEnabled(enabled)
         self.model_input.setEnabled(enabled)
         self.language_combo.setEnabled(enabled)
+        self.temperature_spinbox.setEnabled(enabled) # Enable/disable temperature
         self.instruction_input.setEnabled(enabled)
         self.apply_save_button.setEnabled(enabled)
         self.pdf_list_widget.setEnabled(enabled)
@@ -757,12 +803,14 @@ class StudyApp(QMainWindow):
         self.current_question = None
         self.quiz_active = False # True if ANY PDFs uploaded
         self.gemini_configured = False
-        self.model = None
+        self.model: Union[genai.GenerativeModel, None] = None # Type hint for model (using Union)
         self.api_key = ""
         self.selected_model_name = DEFAULT_MODEL
         self.system_instruction = DEFAULT_SYSTEM_INSTRUCTION
         self.selected_language = DEFAULT_LANGUAGE
+        self.selected_temperature = DEFAULT_TEMPERATURE # Added temperature state
         self.current_reference = None # Parsed ref dict {'doc_index': int, 'page': int}
+        self.current_chat_session: Union[ChatSession, None] = None # For memory (using Union)
 
         # --- Gamification & Difficulty State ---
         # Progress is tracked per individual PDF skill only
@@ -814,8 +862,9 @@ class StudyApp(QMainWindow):
         self.apply_stylesheet()
 
         # --- Load Config and Initial State ---
-        self.load_config()
+        self.load_config() # Loads settings including temperature
         if not self.gemini_configured:
+            # configure_ai is called within load_config if key exists
             self.update_status_message("AI not configured. Go to Settings.")
         self.update_header_stats()
         self.update_skill_path_display() # Populate skill path initially
@@ -857,12 +906,16 @@ class StudyApp(QMainWindow):
         # Find highest level achieved across individual skills
         max_level = 1
         if self.skill_progress:
-            max_level = max(data['level'] for data in self.skill_progress.values()) if self.skill_progress else 1
+             # Filter out potential non-skill entries before finding max
+             skill_levels = [data['level'] for name, data in self.skill_progress.items() if name != ALL_MATERIALS_SKILL_NAME]
+             if skill_levels:
+                 max_level = max(skill_levels)
         self.level_label.setText(f"⭐ Level: {max_level}")
+
 
     def apply_stylesheet(self):
         """Applies QSS styles for the Duolingo look."""
-        # --- Reusing the same QSS from the provided 'new code' ---
+        # --- Reusing the same QSS from the previous version ---
         qss = f"""
             QMainWindow {{
                 background-color: {APP_BG_COLOR};
@@ -935,7 +988,7 @@ class StudyApp(QMainWindow):
                 left: 10px;
                 color: #546E7A;
             }}
-            QTextEdit, QLineEdit, QComboBox {{
+            QTextEdit, QLineEdit, QComboBox, QDoubleSpinBox {{ /* Added QDoubleSpinBox */
                 border: 1px solid #CFD8DC;
                 border-radius: 5px;
                 padding: 8px;
@@ -943,7 +996,7 @@ class StudyApp(QMainWindow):
                 color: #37474F;
                 font-size: 11pt;
             }}
-            QTextEdit:disabled, QLineEdit:disabled, QComboBox:disabled {{
+            QTextEdit:disabled, QLineEdit:disabled, QComboBox:disabled, QDoubleSpinBox:disabled {{
                 background-color: #ECEFF1; /* Slightly greyed out when disabled */
                 color: #90A4AE;
             }}
@@ -1028,6 +1081,8 @@ class StudyApp(QMainWindow):
         self.update_skill_path_display() # Ensure it's up-to-date
         self.view_stack.setCurrentIndex(0)
         self.current_skill_name = None # No skill active when viewing path
+        self.current_chat_session = None # Clear chat session when leaving quiz view
+        print("Cleared chat session.")
 
     def show_quiz_view(self, skill_name):
         self.current_skill_name = skill_name
@@ -1040,12 +1095,26 @@ class StudyApp(QMainWindow):
         self.quiz_widget.set_reference_button_enabled(False)
         self.quiz_widget.set_buttons_state('initial') # Set initial button state
 
+        # Initialize chat session (Memory) for this quiz run
+        if self.model:
+            try:
+                # Start a new chat session when entering the quiz view
+                self.current_chat_session = self.model.start_chat(history=[])
+                print(f"Started new chat session for skill: {skill_name}")
+            except Exception as e:
+                QMessageBox.critical(self, "Chat Error", f"Could not start chat session: {e}")
+                self.current_chat_session = None # Ensure it's None on failure
+        else:
+            self.current_chat_session = None # No model, no chat
+
+
     def show_settings_view(self):
         # Update settings UI with current state before showing
         self.settings_widget.set_settings({
             'api_key': self.api_key,
             'model': self.selected_model_name,
             'language': self.selected_language,
+            'temperature': self.selected_temperature, # Pass temperature
             'instruction': self.system_instruction
         })
         self.settings_widget.update_pdf_list(self.pdf_file_basenames)
@@ -1064,6 +1133,13 @@ class StudyApp(QMainWindow):
                 self.selected_model_name = config.get('Settings', 'Model', fallback=DEFAULT_MODEL)
                 loaded_instruction = config.get('Settings', 'SystemInstruction', fallback=DEFAULT_SYSTEM_INSTRUCTION)
                 self.selected_language = config.get('Settings', 'Language', fallback=DEFAULT_LANGUAGE)
+                # Load temperature, handling potential errors
+                try:
+                    self.selected_temperature = config.getfloat('Settings', 'Temperature', fallback=DEFAULT_TEMPERATURE)
+                except (ValueError, configparser.NoOptionError, configparser.NoSectionError):
+                    self.selected_temperature = DEFAULT_TEMPERATURE
+                    print(f"Warning: Could not read temperature from config, using default {DEFAULT_TEMPERATURE}")
+
 
                 # Update default if loaded, store current value
                 if loaded_instruction:
@@ -1075,9 +1151,7 @@ class StudyApp(QMainWindow):
                 if config.has_section('Progress'):
                     for skill_name in config['Progress']:
                         try:
-                            # Parse data like: score=10,streak=2,level=1,answered=5,diff_idx=0
                             data_str = config['Progress'][skill_name]
-                            # Use regex to handle potential missing keys gracefully
                             data = {}
                             for item in data_str.split(','):
                                 key_val = item.split('=', 1)
@@ -1109,6 +1183,7 @@ class StudyApp(QMainWindow):
             self.selected_model_name = DEFAULT_MODEL
             self.system_instruction = DEFAULT_SYSTEM_INSTRUCTION
             self.selected_language = DEFAULT_LANGUAGE
+            self.selected_temperature = DEFAULT_TEMPERATURE # Set default temp
             self.skill_progress = {} # Reset progress if no config
 
         # Update settings UI elements
@@ -1116,6 +1191,7 @@ class StudyApp(QMainWindow):
             'api_key': self.api_key,
             'model': self.selected_model_name,
             'language': self.selected_language,
+            'temperature': self.selected_temperature, # Update UI
             'instruction': self.system_instruction
         })
         self.update_status_message()
@@ -1129,7 +1205,8 @@ class StudyApp(QMainWindow):
         config['Settings'] = {
             'Model': self.selected_model_name,
             'SystemInstruction': self.system_instruction,
-            'Language': self.selected_language
+            'Language': self.selected_language,
+            'Temperature': str(self.selected_temperature) # Save temperature
         }
         # Save progress (only for individual skills)
         config['Progress'] = {}
@@ -1161,20 +1238,24 @@ class StudyApp(QMainWindow):
         if not gemini_imported:
             self.update_status_message("Error: google-generativeai library not installed.")
             self.gemini_configured = False; self.model = None
+            self.current_chat_session = None # Clear chat session if AI fails
             return False
 
         # Get values directly from state variables
         api_key_val = self.api_key
         model_name_val = self.selected_model_name
         system_instruction_val = self.system_instruction
+        temperature_val = self.selected_temperature # Get temperature
 
         if not api_key_val:
             self.update_status_message("Error: API Key is missing.")
             self.gemini_configured = False; self.model = None
+            self.current_chat_session = None
             return False
         if not model_name_val:
             self.update_status_message("Error: Model Name is missing.")
             self.gemini_configured = False; self.model = None
+            self.current_chat_session = None
             return False
 
         self.update_status_message("Configuring AI...")
@@ -1182,28 +1263,35 @@ class StudyApp(QMainWindow):
 
         try:
             genai.configure(api_key=api_key_val)
+
+            # Create generation config including temperature
+            generation_config = GenerationConfigDict(temperature=temperature_val)
+
             self.model = genai.GenerativeModel(
                 model_name=model_name_val,
-                system_instruction=system_instruction_val
+                system_instruction=system_instruction_val,
+                generation_config=generation_config # Pass generation config
             )
             self.gemini_configured = True
-            self.update_status_message(f"AI Configured with model '{model_name_val}'.")
+            self.current_chat_session = None # Invalidate any old chat session
+            self.update_status_message(f"AI Configured: '{model_name_val}' (Temp: {temperature_val}).")
+            print(f"AI Configured: Model='{model_name_val}', Temp={temperature_val}")
             return True
 
-        except google.api_core.exceptions.PermissionDenied:
-            QMessageBox.critical(self, "AI Config Error", "Permission Denied. Check API Key/Project.")
-            self.update_status_message("Error: Permission Denied.")
-            self.gemini_configured = False; self.model = None; return False
+        except (google.api_core.exceptions.PermissionDenied, google.api_core.exceptions.Unauthenticated) as auth_err:
+             QMessageBox.critical(self, "AI Config Error", f"Authentication Error: {auth_err}. Check API Key/Project.")
+             self.update_status_message("Error: Authentication Failed.")
+             self.gemini_configured = False; self.model = None; self.current_chat_session = None; return False
         except google.api_core.exceptions.NotFound:
             QMessageBox.critical(self, "AI Config Error", f"Model '{model_name_val}' not found.")
             self.update_status_message(f"Error: Model '{model_name_val}' not found.")
-            self.gemini_configured = False; self.model = None; return False
+            self.gemini_configured = False; self.model = None; self.current_chat_session = None; return False
         except Exception as e:
             error_message = f"Unexpected error during AI config: {e}"
             QMessageBox.critical(self, "AI Config Error", error_message)
             print(f"AI Configuration Error: {e}")
             self.update_status_message(f"Error configuring AI.")
-            self.gemini_configured = False; self.model = None; return False
+            self.gemini_configured = False; self.model = None; self.current_chat_session = None; return False
 
 
     def apply_and_save_config(self):
@@ -1218,9 +1306,10 @@ class StudyApp(QMainWindow):
         self.selected_model_name = settings_data['model']
         self.system_instruction = settings_data['instruction']
         self.selected_language = settings_data['language']
+        self.selected_temperature = settings_data['temperature'] # Get temperature
 
-        if self.save_config(): # Save updated state
-            self.configure_ai() # Reconfigure AI
+        if self.save_config(): # Save updated state (incl. temperature)
+            self.configure_ai() # Reconfigure AI (will use new temperature)
 
     # --- Settings Tab PDF Methods ---
     @Slot(list)
@@ -1444,6 +1533,7 @@ class StudyApp(QMainWindow):
             return
 
         print(f"Starting quiz for: {skill_name}")
+        # show_quiz_view now also initializes the chat session
         self.show_quiz_view(skill_name)
 
 
@@ -1486,6 +1576,10 @@ class StudyApp(QMainWindow):
         if not self.current_skill_name:
              QMessageBox.critical(self, "Error", "No skill or review selected.")
              return
+        # Use chat session if available, otherwise check model config
+        if not self.current_chat_session and not self.gemini_configured:
+             QMessageBox.critical(self, "Error", "AI not configured.")
+             return
         if not self.quiz_active or not self.uploaded_file_references:
              QMessageBox.critical(self, "Error", "Materials not uploaded successfully.")
              return
@@ -1511,12 +1605,13 @@ class StudyApp(QMainWindow):
 
         prompt_parts = []
         file_references_for_prompt = []
+        prompt_text = "" # The text part of the prompt
 
         if is_all_materials_mode:
             # Use all uploaded files
             file_references_for_prompt.extend(self.uploaded_file_references.values())
             doc_list_prompt = self._build_document_list_for_prompt() # Get list with indices
-            prompt_parts.append(
+            prompt_text = (
                 f"Generate a single, clear, text-based exam question in {self.selected_language} with '{difficulty}' difficulty. "
                 f"The question must test understanding of concepts, definitions, or processes explained ONLY within ANY of the provided documents. "
                 f"The question should require more than a simple yes/no answer. Avoid trivial or ambiguous questions.\n\n"
@@ -1531,7 +1626,7 @@ class StudyApp(QMainWindow):
                 self._set_processing_state(False) # Reset processing state manually
                 return
             file_references_for_prompt.append(file_ref)
-            prompt_parts.append(
+            prompt_text = (
                  # Use index 0 for single doc reference tag
                 f"Generate a single, clear, text-based exam question in {self.selected_language} with '{difficulty}' difficulty. "
                 f"The question must test understanding of concepts, definitions, or processes explained ONLY within the provided document ('{self.current_skill_name}'). "
@@ -1540,7 +1635,8 @@ class StudyApp(QMainWindow):
                 f"Document Data:\n"
             )
 
-        prompt_parts.extend(file_references_for_prompt)
+        prompt_parts.append(prompt_text) # Add the text part first
+        prompt_parts.extend(file_references_for_prompt) # Add file objects
 
         if self._start_ai_task(prompt_parts, "next_question"):
             self.quiz_widget.set_buttons_state('processing') # Disable buttons during AI call
@@ -1548,8 +1644,14 @@ class StudyApp(QMainWindow):
 
     def get_guidance(self):
         """Handles 'Get Guidance' click."""
-        if not self.current_question or not self.current_skill_name or not self.quiz_active or not self.uploaded_file_references:
-            QMessageBox.warning(self, "Error", "No active question or materials.")
+        if not self.current_question or not self.current_skill_name:
+            QMessageBox.warning(self, "Error", "No active question or skill.")
+            return
+        if not self.current_chat_session and not self.gemini_configured:
+             QMessageBox.critical(self, "Error", "AI not configured.")
+             return
+        if not self.quiz_active or not self.uploaded_file_references:
+            QMessageBox.warning(self, "Error", "Materials not uploaded successfully.")
             return
         if self.thread is not None and self.thread.isRunning():
             QMessageBox.warning(self, "Busy", "Already processing a task.")
@@ -1559,11 +1661,12 @@ class StudyApp(QMainWindow):
         current_answer = self.quiz_widget.get_answer()
         prompt_parts = []
         file_references_for_prompt = []
+        prompt_text = ""
 
         if is_all_materials_mode:
             file_references_for_prompt.extend(self.uploaded_file_references.values())
             doc_list_prompt = self._build_document_list_for_prompt()
-            prompt_parts.append(
+            prompt_text = (
                 f"Context: The student is answering the following question, based ONLY on the provided documents:\nQuestion: {self.current_question}\n\n"
                 f"Student's current answer: \"{current_answer}\"\n\n"
                 f"Task: Provide a concise hint or guiding question (1-2 sentences) in {self.selected_language} to help the student find the answer using ONLY the provided documents. "
@@ -1578,7 +1681,7 @@ class StudyApp(QMainWindow):
                 QMessageBox.critical(self, "Error", f"Could not find uploaded file data for '{self.current_skill_name}'.")
                 return
             file_references_for_prompt.append(file_ref)
-            prompt_parts.append(
+            prompt_text = (
                 f"Context: The student is answering the following question, based ONLY on the provided document ('{self.current_skill_name}'):\nQuestion: {self.current_question}\n\n"
                 f"Student's current answer: \"{current_answer}\"\n\n"
                 f"Task: Provide a concise hint or guiding question (1-2 sentences) in {self.selected_language} to help the student find the answer using ONLY the provided document. "
@@ -1588,6 +1691,7 @@ class StudyApp(QMainWindow):
                 f"Document Data:\n"
             )
 
+        prompt_parts.append(prompt_text)
         prompt_parts.extend(file_references_for_prompt)
 
         if self._start_ai_task(prompt_parts, "get_guidance"):
@@ -1596,8 +1700,14 @@ class StudyApp(QMainWindow):
 
     def submit_answer(self, user_answer):
         """Handles 'Submit Answer' action."""
-        if not self.current_question or not self.current_skill_name or not self.quiz_active or not self.uploaded_file_references:
-            QMessageBox.warning(self, "Error", "No active question or materials.")
+        if not self.current_question or not self.current_skill_name:
+            QMessageBox.warning(self, "Error", "No active question or skill.")
+            return
+        if not self.current_chat_session and not self.gemini_configured:
+             QMessageBox.critical(self, "Error", "AI not configured.")
+             return
+        if not self.quiz_active or not self.uploaded_file_references:
+            QMessageBox.warning(self, "Error", "Materials not uploaded successfully.")
             return
         if not user_answer:
             QMessageBox.warning(self, "Input Needed", "Please enter an answer.")
@@ -1611,11 +1721,12 @@ class StudyApp(QMainWindow):
         is_all_materials_mode = (self.current_skill_name == ALL_MATERIALS_SKILL_NAME)
         prompt_parts = []
         file_references_for_prompt = []
+        prompt_text = ""
 
         if is_all_materials_mode:
             file_references_for_prompt.extend(self.uploaded_file_references.values())
             doc_list_prompt = self._build_document_list_for_prompt()
-            prompt_parts.append(
+            prompt_text = (
                 f"Context: Evaluate the student's answer based ONLY on the provided documents.\n\n"
                 f"Question: {self.current_question}\n"
                 f"Student's Answer: {user_answer}\n\n"
@@ -1634,7 +1745,7 @@ class StudyApp(QMainWindow):
                 self.quiz_widget.set_answer_enabled(True) # Re-enable on error
                 return
             file_references_for_prompt.append(file_ref)
-            prompt_parts.append(
+            prompt_text = (
                 f"Context: Evaluate the student's answer based ONLY on the provided document ('{self.current_skill_name}').\n\n"
                 f"Question: {self.current_question}\n"
                 f"Student's Answer: {user_answer}\n\n"
@@ -1647,6 +1758,7 @@ class StudyApp(QMainWindow):
                 f"Document Data:\n"
             )
 
+        prompt_parts.append(prompt_text)
         prompt_parts.extend(file_references_for_prompt)
 
         if self._start_ai_task(prompt_parts, "submit_answer"):
@@ -1655,9 +1767,12 @@ class StudyApp(QMainWindow):
 
     # --- AI Call Handling (using QThread) ---
     def _start_ai_task(self, prompt_parts, task_identifier):
-        """Starts an AI task (question, guidance, submit) in the worker thread."""
-        if not self.gemini_configured or self.model is None:
-            QMessageBox.critical(self, "Error", "AI is not configured.")
+        """Starts an AI task (question, guidance, submit) in the worker thread, using chat session if available."""
+        # Determine if we should use the chat session or the base model
+        ai_object = self.current_chat_session if self.current_chat_session else self.model
+
+        if not ai_object:
+            QMessageBox.critical(self, "Error", "AI is not configured or chat session not started.")
             self._set_processing_state(False) # Ensure UI is re-enabled
             return False
         if self.thread is not None and self.thread.isRunning():
@@ -1673,7 +1788,8 @@ class StudyApp(QMainWindow):
 
         # --- Setup Thread and Worker ---
         self.thread = QThread(self)
-        self.worker = AIWorker(self.model, prompt_parts, task_identifier)
+        # Pass the appropriate AI object (model or chat session) to the worker
+        self.worker = AIWorker(ai_object, prompt_parts, task_identifier)
         self.worker.moveToThread(self.thread)
 
         # --- Connect Signals ---
@@ -1838,9 +1954,12 @@ class StudyApp(QMainWindow):
         # Settings Button in header
         self.settings_button.setEnabled(not is_actively_processing)
 
-        # Quiz buttons are handled by quiz_widget.set_buttons_state based on AI call results/errors
-        # But ensure back button is disabled during processing
-        self.quiz_widget.back_button.setEnabled(not is_actively_processing)
+        # Disable quiz buttons *during* processing
+        if self.view_stack.currentIndex() == 1: # If on quiz view
+            if is_actively_processing:
+                 self.quiz_widget.set_buttons_state('processing')
+            # Button state after processing is handled in _on_thread_finished or _handle_ai_result/_handle_ai_error
+
         self.settings_widget.back_button.setEnabled(not is_actively_processing)
 
         # Special handling for Upload button
@@ -1862,34 +1981,26 @@ class StudyApp(QMainWindow):
         self.quiz_widget.set_feedback(text, feedback_type) # Set text and color
 
         # --- Parse Reference ---
-        # Reference format from AI should be "Reference: [Index]:[Page Number]"
-        # Index refers to the list provided in the prompt (either single doc [0] or list index)
         match = REFERENCE_REGEX.search(text)
         if match:
             try:
                 doc_index_from_ai = int(match.group(1))
                 page_num = int(match.group(2))
-
                 is_all_materials_mode = (self.current_skill_name == ALL_MATERIALS_SKILL_NAME)
-
-                # Determine the actual index in the main self.pdf_file_paths list
                 actual_doc_index = -1
+
                 if is_all_materials_mode:
-                    # AI gives index based on the full list provided in the prompt
                     actual_doc_index = doc_index_from_ai
                 else:
-                    # AI gives index [0], map it to the current skill's index in the main list
                     if self.current_skill_name in self.pdf_file_basenames:
                         actual_doc_index = self.pdf_file_basenames.index(self.current_skill_name)
 
-                # Validate the actual index
                 if 0 <= actual_doc_index < len(self.pdf_file_paths):
                     self.current_reference = {'doc_index': actual_doc_index, 'page': page_num}
                     self.quiz_widget.set_reference_button_enabled(True) # Enable button
                     print(f"Found reference: Mapped Index={actual_doc_index} ('{self.pdf_file_basenames[actual_doc_index]}'), Page={page_num}")
                 else:
                     print(f"Warning: Found ref tag but calculated Doc Index {actual_doc_index} is out of range.")
-
             except (ValueError, IndexError) as e:
                 print(f"Error parsing reference tag: {match.group(0)} - {e}")
 
@@ -1929,8 +2040,6 @@ class StudyApp(QMainWindow):
             # Try fallback
             try:
                 abs_path = os.path.abspath(file_path)
-                # Handle spaces and potential special characters better for file URI
-                import urllib.parse
                 file_uri = urllib.parse.urljoin('file:', urllib.request.pathname2url(abs_path))
                 webbrowser.open(file_uri)
             except Exception as wb_err:
@@ -1944,7 +2053,9 @@ class StudyApp(QMainWindow):
         print(f"QThread finished signal received. Clearing Python references.") # Debug
         # Store references before clearing
         worker_type = type(self.worker).__name__ if self.worker else "None"
-        task_id = self.worker.task_identifier if hasattr(self.worker, 'task_identifier') else "N/A"
+        task_id = "N/A"
+        if self.worker and hasattr(self.worker, 'task_identifier'):
+             task_id = self.worker.task_identifier
 
         self.thread = None
         self.worker = None
